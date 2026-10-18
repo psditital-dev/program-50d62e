@@ -1,4 +1,4 @@
-//! PumpCuts router: permanent per-mint pump.fun fee receiver that sells a share of the
+//! PumpShare router: permanent per-mint pump.fun fee receiver that sells a share of the
 //! fee income BOOKED by this program inside a fixed term. See ../README.md.
 #![cfg_attr(not(test), no_std)]
 

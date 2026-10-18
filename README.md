@@ -1,4 +1,4 @@
-# PumpCuts router
+# PumpShare router
 
 Solana program (Pinocchio) that lets a pump.fun coin creator sell a share of the coin's future creator fees for a fixed
 term, split into units. Buyers pay the creator up front; during the term every booked fee is split between the
