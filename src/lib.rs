@@ -12,7 +12,7 @@ use pinocchio::{AccountView, Address, ProgramResult, Resize};
 use pinocchio_system::instructions::{Allocate, Assign, Transfer};
 
 #[cfg(not(feature = "no-entrypoint"))]
-pinocchio::program_entrypoint!(process_instruction, 13);
+pinocchio::program_entrypoint!(process_instruction, 14);
 pinocchio::no_allocator!();
 pinocchio::nostd_panic_handler!();
 
@@ -54,6 +54,7 @@ const SOURCE: u8 = 2;
 const TERM: u8 = 3;
 const POSITION: u8 = 4;
 const CLOSED: u8 = 5; // wound-down Source: forwards everything to the creator's payout
+const OFFER: u8 = 6;
 mod c {
     pub const BUMP: usize = 1;
     pub const ADMIN: usize = 2;
@@ -105,7 +106,18 @@ mod t {
     pub const RESERVED: usize = 128; // u64
     pub const CLAIMED: usize = 136; // u64
     pub const OPEN: usize = 144; // u32, open positions
-    pub const LEN: usize = 148;
+    pub const CURVE: usize = 148; // u8, 1 = unit price falls with the time left (floor MIN_PRICE)
+    pub const LEN: usize = 149;
+}
+// Resale offer of a holder's units (term sold out, still running): ["offer", position].
+mod o {
+    pub const BUMP: usize = 1;
+    pub const POSITION: usize = 2;
+    pub const SELLER: usize = 34; // position owner; unit payments go here
+    pub const TERM: usize = 66;
+    pub const UNITS: usize = 98; // u32, still offered
+    pub const PRICE: usize = 102; // u64, lamports per unit
+    pub const LEN: usize = 110;
 }
 mod p {
     pub const BUMP: usize = 1;
@@ -263,6 +275,55 @@ fn position(a: &AccountView) -> Result<[u8; p::LEN], ProgramError> {
     let d = load(a, POSITION)?;
     check_pda(a, &[b"pos", &d[p::TERM..p::TERM + 32], &d[p::OWNER..p::OWNER + 32], &[d[p::BUMP]]])?;
     Ok(d)
+}
+fn offer_of(a: &AccountView) -> Result<[u8; o::LEN], ProgramError> {
+    let d = load(a, OFFER)?;
+    check_pda(a, &[b"offer", &d[o::POSITION..o::POSITION + 32], &[d[o::BUMP]]])?;
+    Ok(d)
+}
+/// Unit price now: fixed, or (curve) falling linearly with the time left, never below MIN_PRICE.
+fn unit_price(td: &[u8], now: i64) -> Result<u64, ProgramError> {
+    let price = u64_at(td, t::PRICE)?;
+    if td[t::CURVE] == 0 {
+        return Ok(price);
+    }
+    let (start, end) = (i64_at(td, t::START)?, i64_at(td, t::END)?);
+    need(start <= now && now < end, Error::TermEnded)?;
+    let left = mul_div(price, (end - now) as u64, (end - start) as u64).ok_or(err(Error::MathOverflow))?;
+    Ok(left.max(MIN_PRICE))
+}
+/// The buyer's position in `tm`: created on first purchase (open count +1), or loaded with what its
+/// old units earned fixed into `accrued` before the entry index moves.
+fn open_position(buyer: &AccountView, tm: &AccountView, pos: &AccountView, td: &mut [u8; t::LEN]) -> Result<[u8; p::LEN], ProgramError> {
+    if pos.owned_by(&SYSTEM) && pos.data_len() == 0 {
+        let bump = [find(&[b"pos", tm.address().as_ref(), buyer.address().as_ref()], pos)?];
+        init_account(
+            buyer,
+            pos,
+            p::LEN,
+            &[Seed::from(b"pos"), Seed::from(tm.address().as_ref()), Seed::from(buyer.address().as_ref()), Seed::from(&bump)],
+        )?;
+        let mut pd = [0u8; p::LEN];
+        pd[0] = POSITION;
+        pd[p::BUMP] = bump[0];
+        put(&mut pd, p::TERM, tm.address().as_ref())?;
+        put(&mut pd, p::OWNER, buyer.address().as_ref())?;
+        put(&mut pd, p::PAYOUT, buyer.address().as_ref())?;
+        let open = u32_at(td, t::OPEN)?.checked_add(1).ok_or(err(Error::MathOverflow))?;
+        put(td, t::OPEN, &open.to_le_bytes())?;
+        Ok(pd)
+    } else {
+        let mut pd = position(pos)?;
+        need(key(&pd, p::TERM)? == *tm.address() && key(&pd, p::OWNER)? == *buyer.address(), Error::Unauthorized)?;
+        settle_units(&mut pd, u128_at(td, t::INDEX)?)?;
+        Ok(pd)
+    }
+}
+/// Fix what a position's units earned up to `index` into `accrued`; entry moves to `index`.
+fn settle_units(pd: &mut [u8; p::LEN], index: u128) -> ProgramResult {
+    let got = earned(u32_at(pd, p::UNITS)?, index, u128_at(pd, p::ENTRY)?).ok_or(err(Error::MathOverflow))?;
+    inc(pd, p::ACCRUED, got)?;
+    put(pd, p::ENTRY, &index.to_le_bytes())
 }
 fn save(a: &mut AccountView, d: &[u8]) -> ProgramResult {
     writable(a)?;
@@ -514,6 +575,9 @@ pub fn process_instruction(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Pr
         10 => set_payout(a, args),
         11 => end_term_early(a),
         12 => close_source(a),
+        13 => offer(a, args),
+        14 => take(a, args),
+        15 => cancel_offer(a),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -617,7 +681,7 @@ fn register_source(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
 }
 
 /// [creator(S,W), config, source(W), term(W), sharing_config, system];
-/// args: share_bps u16, units u32, days u8 (7|30), price u64.
+/// args: share_bps u16, units u32, days u8 (7|30), price u64, [curve u8: 1 = price falls with the time left].
 fn list_term(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let [creator, cfg, src, tm, sc, sys, ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -633,6 +697,8 @@ fn list_term(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let units = u32::from_le_bytes(rd(d, 2)?);
     let days = byte(d, 6)?;
     let price = u64::from_le_bytes(rd(d, 7)?);
+    let curve = if d.len() > 15 { byte(d, 15)? } else { 0 };
+    need(curve <= 1, Error::BadParams)?;
     need(
         (500..=5000).contains(&share) && (10..=10_000).contains(&units) && (days == 7 || days == 30) && price >= MIN_PRICE,
         Error::BadParams,
@@ -665,6 +731,7 @@ fn list_term(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     put(&mut td, t::FILL, &rd::<2>(&cd, c::FILL_BPS)?)?;
     put(&mut td, t::UNITS, &units.to_le_bytes())?;
     put(&mut td, t::PRICE, &price.to_le_bytes())?;
+    td[t::CURVE] = curve;
     put(&mut sd, s::SEQ, &seq)?;
     put(&mut sd, s::END, &end.to_le_bytes())?;
     put(&mut sd, s::TERM, tm.address().as_ref())?;
@@ -704,38 +771,14 @@ fn buy(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let left = u32_at(&td, t::UNITS)?.checked_sub(sold).ok_or(err(Error::MathOverflow))?;
     need(units > 0, Error::BadParams)?;
     need(units <= left, Error::SoldOut)?;
-    let cost = u64_at(&td, t::PRICE)?.checked_mul(units as u64).ok_or(err(Error::MathOverflow))?;
+    let cost = unit_price(&td, now)?.checked_mul(units as u64).ok_or(err(Error::MathOverflow))?;
     let fill = mul_div(cost, u16_at(&td, t::FILL)? as u64, BPS).ok_or(err(Error::MathOverflow))?;
     Transfer { from: buyer, to: payout, lamports: cost }.invoke()?;
     if fill > 0 {
         Transfer { from: buyer, to: platform, lamports: fill }.invoke()?;
     }
     let index = u128_at(&td, t::INDEX)?;
-    let mut pd = if pos.owned_by(&SYSTEM) && pos.data_len() == 0 {
-        let bump = [find(&[b"pos", tm.address().as_ref(), buyer.address().as_ref()], pos)?];
-        init_account(
-            buyer,
-            pos,
-            p::LEN,
-            &[Seed::from(b"pos"), Seed::from(tm.address().as_ref()), Seed::from(buyer.address().as_ref()), Seed::from(&bump)],
-        )?;
-        let mut pd = [0u8; p::LEN];
-        pd[0] = POSITION;
-        pd[p::BUMP] = bump[0];
-        put(&mut pd, p::TERM, tm.address().as_ref())?;
-        put(&mut pd, p::OWNER, buyer.address().as_ref())?;
-        put(&mut pd, p::PAYOUT, buyer.address().as_ref())?;
-        let open = u32_at(&td, t::OPEN)?.checked_add(1).ok_or(err(Error::MathOverflow))?;
-        put(&mut td, t::OPEN, &open.to_le_bytes())?;
-        pd
-    } else {
-        let mut pd = position(pos)?;
-        need(key(&pd, p::TERM)? == *tm.address() && key(&pd, p::OWNER)? == *buyer.address(), Error::Unauthorized)?;
-        // Fix what the old units earned before the entry index moves.
-        let got = earned(u32_at(&pd, p::UNITS)?, index, u128_at(&pd, p::ENTRY)?).ok_or(err(Error::MathOverflow))?;
-        inc(&mut pd, p::ACCRUED, got)?;
-        pd
-    };
+    let mut pd = open_position(buyer, tm, pos, &mut td)?;
     let held = u32_at(&pd, p::UNITS)?.checked_add(units).ok_or(err(Error::MathOverflow))?;
     put(&mut pd, p::UNITS, &held.to_le_bytes())?;
     put(&mut pd, p::ENTRY, &index.to_le_bytes())?;
@@ -743,6 +786,121 @@ fn buy(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     save(pos, &pd)?;
     save(tm, &td)?;
     save(src, &sd)
+}
+
+/// Resale (TZ 6.4): a holder offers units of a SOLD-OUT running term. One offer per position,
+/// re-offering overwrites units and price. Nothing is locked: `take` re-checks the position.
+/// [seller(S,W), config, source, term, position, offer(W), system]; args: units u32, price u64.
+fn offer(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    let [seller, cfg, src, tm, pos, off, sys, ..] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    live(&config(cfg)?)?;
+    system(sys)?;
+    signer(seller)?;
+    let sd = source(src)?;
+    let td = term(tm, &sd)?;
+    let pd = position(pos)?;
+    need(key(&pd, p::TERM)? == *tm.address() && key(&pd, p::OWNER)? == *seller.address(), Error::Unauthorized)?;
+    need(now()? < i64_at(&td, t::END)?, Error::TermEnded)?;
+    need(u32_at(&td, t::SOLD)? == u32_at(&td, t::UNITS)?, Error::BadParams)?;
+    let units = u32::from_le_bytes(rd(d, 0)?);
+    let price = u64::from_le_bytes(rd(d, 4)?);
+    need(units > 0 && units <= u32_at(&pd, p::UNITS)? && price >= MIN_PRICE, Error::BadParams)?;
+    need(price.checked_mul(units as u64).is_some(), Error::BadParams)?;
+    let mut od = if off.owned_by(&ID) {
+        let od = offer_of(off)?;
+        need(key(&od, o::POSITION)? == *pos.address(), Error::BadAccount)?;
+        od
+    } else {
+        let bump = [find(&[b"offer", pos.address().as_ref()], off)?];
+        init_account(seller, off, o::LEN, &[Seed::from(b"offer"), Seed::from(pos.address().as_ref()), Seed::from(&bump)])?;
+        let mut od = [0u8; o::LEN];
+        od[0] = OFFER;
+        od[o::BUMP] = bump[0];
+        put(&mut od, o::POSITION, pos.address().as_ref())?;
+        put(&mut od, o::SELLER, seller.address().as_ref())?;
+        put(&mut od, o::TERM, tm.address().as_ref())?;
+        od
+    };
+    put(&mut od, o::UNITS, &units.to_le_bytes())?;
+    put(&mut od, o::PRICE, &price.to_le_bytes())?;
+    save(off, &od)
+}
+
+/// Buy offered units. The seller keeps everything its units earned up to now (booked first, like
+/// `buy`); the buyer earns from this moment. Payment goes straight to the seller, no fee.
+/// [buyer(S,W), config, source(W), term(W), offer(W), seller position(W), buyer position(W),
+///  seller(W), system, sharing_config, bonding_curve, pump creator vault, (pool, amm ATA if migrated)];
+/// args: units u32, max_price u64 (the seller can re-price; the buyer never pays more than it saw).
+fn take(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    let [buyer, cfg, src, tm, off, spos, bpos, seller, sys, sc, bc, vault, rest @ ..] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    live(&config(cfg)?)?;
+    system(sys)?;
+    signer(buyer)?;
+    writable(src)?;
+    let mut sd = source(src)?;
+    let mut td = term(tm, &sd)?;
+    let mint = key(&sd, s::MINT)?;
+    need(tm.address() == &key(&sd, s::TERM)?, Error::BadAccount)?;
+    need(buyer.address() != &key(&sd, s::CREATOR)? && buyer.address() != &key(&sd, s::PAYOUT)?, Error::BadParams)?;
+    route_fixed(sc, &mint, src.address())?;
+    swept(sc, bc, vault, rest, &mint)?;
+    let now = now()?;
+    need(now < i64_at(&td, t::END)?, Error::TermEnded)?;
+    // income that arrived before the sale is the seller's: book it into the index first
+    book(&mut sd, src.lamports(), Some(&mut td), now, true)?;
+    let mut od = offer_of(off)?;
+    need(key(&od, o::TERM)? == *tm.address() && key(&od, o::POSITION)? == *spos.address(), Error::BadAccount)?;
+    need(key(&od, o::SELLER)? == *seller.address() && buyer.address() != seller.address(), Error::Unauthorized)?;
+    let units = u32::from_le_bytes(rd(d, 0)?);
+    let max_price = u64::from_le_bytes(rd(d, 4)?);
+    let price = u64_at(&od, o::PRICE)?;
+    need(units > 0 && units <= u32_at(&od, o::UNITS)?, Error::SoldOut)?;
+    need(price <= max_price, Error::BadParams)?;
+    let mut sp = position(spos)?;
+    need(key(&sp, p::TERM)? == *tm.address() && key(&sp, p::OWNER)? == *seller.address(), Error::Unauthorized)?;
+    let index = u128_at(&td, t::INDEX)?;
+    settle_units(&mut sp, index)?;
+    let left = u32_at(&sp, p::UNITS)?.checked_sub(units).ok_or(err(Error::SoldOut))?;
+    put(&mut sp, p::UNITS, &left.to_le_bytes())?;
+    let mut bp = open_position(buyer, tm, bpos, &mut td)?;
+    let held = u32_at(&bp, p::UNITS)?.checked_add(units).ok_or(err(Error::MathOverflow))?;
+    put(&mut bp, p::UNITS, &held.to_le_bytes())?;
+    put(&mut bp, p::ENTRY, &index.to_le_bytes())?;
+    let cost = price.checked_mul(units as u64).ok_or(err(Error::MathOverflow))?;
+    Transfer { from: buyer, to: seller, lamports: cost }.invoke()?;
+    save(spos, &sp)?;
+    save(bpos, &bp)?;
+    save(tm, &td)?;
+    save(src, &sd)?;
+    let rest_units = u32_at(&od, o::UNITS)? - units;
+    if rest_units == 0 {
+        close(off, seller)
+    } else {
+        put(&mut od, o::UNITS, &rest_units.to_le_bytes())?;
+        save(off, &od)
+    }
+}
+
+/// Close an offer, rent back to the seller: the seller any time; anyone once its term has ended
+/// (wind-down closes every offer this way after end_term_early). [who(S), source, term, offer(W), seller(W)].
+fn cancel_offer(a: &mut [AccountView]) -> ProgramResult {
+    let [who, src, tm, off, seller, ..] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    signer(who)?;
+    let od = offer_of(off)?;
+    need(key(&od, o::SELLER)? == *seller.address() && key(&od, o::TERM)? == *tm.address(), Error::Unauthorized)?;
+    // a closed term (account gone after close_term) has ended for good
+    if who.address() != seller.address() && tm.owned_by(&ID) {
+        let sd = source(src)?;
+        let td = term(tm, &sd)?;
+        need(now()? >= i64_at(&td, t::END)?, Error::TermNotEnded)?;
+    }
+    close(off, seller)
 }
 
 /// Permissionless. [source(W), term(W)]: term = the source's latest term (ignored outside it).
