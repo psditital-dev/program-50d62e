@@ -381,27 +381,46 @@ fn init_account(payer: &AccountView, new: &AccountView, len: usize, seeds: &[See
 }
 /// Move lamports out of an account this program owns.
 fn pay(from: &mut AccountView, to: &mut AccountView, amount: u64) -> ProgramResult {
-    writable(from)?;
-    writable(to)?;
-    need(from.address() != to.address(), Error::BadAccount)?;
     if amount == 0 {
         return Ok(());
     }
+    writable(from)?;
+    writable(to)?;
+    need(from.address() != to.address(), Error::BadAccount)?;
     let left = sub(from.lamports(), amount)?;
     let got = add(to.lamports(), amount)?;
     from.set_lamports(left);
     to.set_lamports(got);
     Ok(())
 }
-/// An address the runtime can never credit: executable, sysvar-owned, reserved id, or this
-/// program's own state. Only such STRUCTURAL failures reroute money to the platform wallet;
-/// a low or zero balance never does.
+/// An address the runtime can never credit: executable, sysvar-owned, reserved id. Only such
+/// STRUCTURAL failures reroute money to the platform wallet; a low or zero balance never does.
+/// (This program's own state is refused when a payout / platform is chosen, see `chosen_ok`; a
+/// record created later at a chosen address still takes credits, so it is paid, never rerouted.)
 fn uncreditable(a: &AccountView) -> bool {
-    a.executable() || a.owned_by(&SYSVAR) || a.owned_by(&ID) || RESERVED.contains(a.address())
+    a.executable() || a.owned_by(&SYSVAR) || RESERVED.contains(a.address())
+}
+/// A payout / platform being chosen now: creditable and not this program's state.
+fn chosen_ok(a: &AccountView) -> bool {
+    !uncreditable(a) && !a.owned_by(&ID)
+}
+/// Can `to` take `amount` (+ `extra` more later in this instruction)? The runtime refuses a credit that
+/// leaves an account below the rent-exempt minimum for its size, also one that was already below it.
+fn takes(to: &AccountView, amount: u64, extra: u64) -> Result<bool, ProgramError> {
+    Ok(amount == 0 || add(add(to.lamports(), amount)?, extra)? >= rent(to.data_len())?)
+}
+/// `takes` for a payout, rerouted to the platform when the payout is uncreditable (as `pay_out` does).
+fn fits(dest: &AccountView, platform: &AccountView, amount: u64, extra: u64) -> Result<bool, ProgramError> {
+    if uncreditable(dest) {
+        takes(platform, amount, 0)
+    } else {
+        takes(dest, amount, extra)
+    }
 }
 /// Pay `amount` from the source to the stored payout (platform if uncreditable). `extra` = lamports
 /// the same payout receives later in this instruction (closed position rent). An empty payout that
 /// would end below the rent-exempt minimum is refused with PayoutBelowRent: the debt stays.
+/// Callers on the collect and wind-down paths check `fits` first and never reach that refusal.
 fn pay_out(
     src: &mut AccountView,
     dest: &mut AccountView,
@@ -416,10 +435,7 @@ fn pay_out(
         need(platform.address() == &key(cd, c::PLATFORM)?, Error::Unauthorized)?;
         return pay(src, platform, amount);
     }
-    need(
-        amount == 0 || dest.lamports() > 0 || add(amount, extra)? >= rent(0)?,
-        Error::PayoutBelowRent,
-    )?;
+    need(takes(dest, amount, extra)?, Error::PayoutBelowRent)?;
     pay(src, dest, amount)
 }
 fn close(acc: &mut AccountView, to: &mut AccountView) -> ProgramResult {
@@ -702,7 +718,7 @@ fn admin_platform(admin: &AccountView, platform: &AccountView, cfg: &Address) ->
     for k in [admin.address(), platform.address()] {
         need(*k != ZERO && k != &ID && k != cfg && *k != SYSTEM, Error::BadParams)?;
     }
-    need(!uncreditable(platform), Error::BadParams)
+    need(chosen_ok(platform), Error::BadParams)
 }
 
 /// [authority(S,W), config(W), program, programdata, system, platform, admin(S)]; args: admin, platform.
@@ -754,7 +770,12 @@ fn set_config(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let fill = u16::from_le_bytes(rd(d, 64)?);
     let paused = byte(d, 66)?;
     need(fill <= MAX_FILL_BPS && paused <= 1, Error::BadParams)?;
-    admin_platform(new_admin_acc, platform, cfg.address())?;
+    if new_admin == key(&cd, c::ADMIN)? && *platform.address() == key(&cd, c::PLATFORM)? {
+        // unchanged pair: not re-validated, so a pause (the first wind-down step) never stalls on it
+        signer(new_admin_acc)?;
+    } else {
+        admin_platform(new_admin_acc, platform, cfg.address())?;
+    }
     put(&mut cd, c::ADMIN, new_admin.as_ref())?;
     put(&mut cd, c::PLATFORM, platform.address().as_ref())?;
     put(&mut cd, c::FILL_BPS, &fill.to_le_bytes())?;
@@ -1029,9 +1050,23 @@ fn buy(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     need(units <= left, Error::SoldOut)?;
     let cost = unit_price(&td, now)?.checked_mul(units as u64).ok_or(err(Error::MathOverflow))?;
     let fill = mul_div(cost, u16_at(&td, t::FILL)? as u64, BPS).ok_or(err(Error::MathOverflow))?;
-    Transfer { from: buyer, to: payout, lamports: cost }.invoke()?;
+    // an empty wallet cannot take less than the rent-exempt minimum: such a payment is held on the
+    // Source as that wallet's due (settled with later income), so a small purchase never fails
+    // (the payout may not be the position about to be created: its balance would go to the buyer)
+    need(payout.address() != pos.address(), Error::BadAccount)?;
+    if takes(payout, cost, 0)? {
+        Transfer { from: buyer, to: payout, lamports: cost }.invoke()?;
+    } else {
+        Transfer { from: buyer, to: src, lamports: cost }.invoke()?;
+        inc(&mut sd, s::CREATOR_DUE, cost)?;
+    }
     if fill > 0 {
-        Transfer { from: buyer, to: platform, lamports: fill }.invoke()?;
+        if takes(platform, fill, 0)? {
+            Transfer { from: buyer, to: platform, lamports: fill }.invoke()?;
+        } else {
+            Transfer { from: buyer, to: src, lamports: fill }.invoke()?;
+            inc(&mut sd, s::PLATFORM_DUE, fill)?;
+        }
     }
     let index = u128_at(&td, t::INDEX)?;
     let mut pd = open_position(buyer, tm, pos, &mut td)?;
@@ -1195,9 +1230,15 @@ fn settle(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     };
     let amount = u64_at(&sd, field)?;
     need(amount > 0, Error::NothingToClaim)?;
+    let to = if who == 0 { key(&sd, s::PAYOUT)? } else { key(&cd, c::PLATFORM)? };
+    need(dest.address() == &to, Error::Unauthorized)?;
+    need(platform.address() == &key(&cd, c::PLATFORM)?, Error::Unauthorized)?;
+    // too small for an empty wallet: the share stays booked (it grows, or close_source folds it)
+    if !fits(dest, platform, amount, 0)? {
+        return Ok(());
+    }
     put(&mut sd, field, &0u64.to_le_bytes())?;
     save(src, &sd)?;
-    let to = if who == 0 { key(&sd, s::PAYOUT)? } else { key(&cd, c::PLATFORM)? };
     pay_out(src, dest, &to, platform, &cd, amount, 0)
 }
 
@@ -1249,7 +1290,15 @@ fn claim(a: &mut [AccountView], admin: bool) -> ProgramResult {
     let payout_key = key(&pd, p::PAYOUT)?;
     // closing: the position rent goes to the owner in this same instruction
     let extra = if ended && payout_key == *owner.address() { pos.lamports() } else { 0 };
-    pay_out(src, payout, &payout_key, platform, &cd, due, extra)?;
+    need(payout.address() == &payout_key, Error::Unauthorized)?;
+    need(platform.address() == &key(&cd, c::PLATFORM)?, Error::Unauthorized)?;
+    if ended && !fits(payout, platform, due, extra)? {
+        // the stored payout cannot take this small due: it goes to the owner together with the
+        // position rent (always above the minimum), so a refund or close never stalls on dust
+        pay(src, owner, due)?;
+    } else {
+        pay_out(src, payout, &payout_key, platform, &cd, due, extra)?;
+    }
     need(src.lamports() >= rent(s::LEN)?, Error::Insolvent)?;
     if ended {
         close(pos, owner)
@@ -1283,13 +1332,15 @@ fn close_term(a: &mut [AccountView]) -> ProgramResult {
 /// or a Position (signer = owner). Uncreditable addresses are refused up front, so a buy (direct
 /// transfer to the creator payout) can never be stopped by the payout choice.
 fn set_payout(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
-    let [who, target, new_payout, ..] = a else {
+    let [who, target, new_payout, cfg, ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
     signer(who)?;
+    // frozen while paused: an admin refund / close_source never fails on a payout changed under it
+    live(&config(cfg)?)?;
     let payout = key(d, 0)?;
     need(
-        new_payout.address() == &payout && payout != ZERO && payout != ID && !uncreditable(new_payout),
+        new_payout.address() == &payout && payout != ZERO && payout != ID && chosen_ok(new_payout),
         Error::BadParams,
     )?;
     let kind = if target.owned_by(&ID) { byte(&target.try_borrow()?, 0)? } else { 0 };
@@ -1333,12 +1384,11 @@ fn end_term_early(a: &mut [AccountView]) -> ProgramResult {
     save(src, &sd)
 }
 
-/// Wind-down, admin while paused, after every term is closed and every due settled.
-/// [admin(S), config, source(W), payout(W), platform(W)].
-/// Compacts the Source to the CLOSED layout and sends the unbooked remainder plus the rent difference
-/// to the creator's payout in one transfer (platform if uncreditable). If an empty payout could not
-/// hold that sum it stays on the compacted Source; collect forwards it later. The address stays pump's
-/// permanent recipient; collect on it then forwards everything to the payout.
+/// Wind-down, admin while paused, after every term is closed. [admin(S), config, source(W), payout(W), platform(W)].
+/// Compacts the Source to the CLOSED layout. The platform's due goes to the platform; everything else (the creator's
+/// due, the unbooked remainder, the rent difference) goes to the creator's payout in one transfer, or to the platform
+/// if that payout cannot take it. Nothing stays behind (a transfer that cannot land fails the whole step). The address
+/// stays pump's permanent recipient; collect on it then forwards everything to the payout.
 fn close_source(a: &mut [AccountView]) -> ProgramResult {
     let [admin, cfg, src, payout, platform, ..] = a else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -1350,15 +1400,26 @@ fn close_source(a: &mut [AccountView]) -> ProgramResult {
     let sd = source(src)?;
     need(now()? >= i64_at(&sd, s::END)?, Error::TermActive)?;
     need(u32_at(&sd, s::OPEN_TERMS)? == 0, Error::PositionsOpen)?;
-    need(
-        u64_at(&sd, s::OWED)? == 0 && u64_at(&sd, s::CREATOR_DUE)? == 0 && u64_at(&sd, s::PLATFORM_DUE)? == 0,
-        Error::PositionsOpen,
-    )?;
+    need(u64_at(&sd, s::OWED)? == 0, Error::PositionsOpen)?;
     let payout_key = key(&sd, s::PAYOUT)?;
     need(payout.address() == &payout_key, Error::Unauthorized)?;
+    need(platform.address() == &key(&cd, c::PLATFORM)?, Error::Unauthorized)?;
+    // dues an empty wallet could not take (settle left them booked) never block the wind-down:
+    // the platform share goes to the platform if it can take it; everything else, the creator's
+    // share included, goes to the creator's payout in one transfer, or to the platform if that
+    // payout cannot take it. Nothing stays behind on the compacted Source.
+    let plat_due = u64_at(&sd, s::PLATFORM_DUE)?;
+    // the platform's share goes to the platform only (the kit keeps that wallet above the minimum)
+    need(takes(platform, plat_due, 0)?, Error::PayoutBelowRent)?;
+    pay(src, platform, plat_due)?;
     let all = sub(src.lamports(), rent(x::LEN)?)?;
-    if uncreditable(payout) || payout.lamports() > 0 || all >= rent(0)? {
+    if fits(payout, platform, all, 0)? {
         pay_out(src, payout, &payout_key, platform, &cd, all, 0)?;
+    } else {
+        // never compact with money left behind (the program may be closed after the wind-down):
+        // the kit funds the platform wallet first, so this only fails if it did not
+        need(takes(platform, all, 0)?, Error::PayoutBelowRent)?;
+        pay(src, platform, all)?;
     }
     let mut xd = [0u8; x::LEN];
     xd[0] = if sd[0] == BAGS { CLOSED_BAGS } else { CLOSED };
@@ -1381,5 +1442,16 @@ fn forward(a: &mut [AccountView]) -> ProgramResult {
     let xd = closed(src)?;
     let amount = sub(src.lamports(), rent(x::LEN)?)?;
     need(amount > 0, Error::NothingToClaim)?;
-    pay_out(src, payout, &key(&xd, x::PAYOUT)?, platform, &cd, amount, 0)
+    let payout_key = key(&xd, x::PAYOUT)?;
+    need(payout.address() == &payout_key, Error::Unauthorized)?;
+    need(platform.address() == &key(&cd, c::PLATFORM)?, Error::Unauthorized)?;
+    if fits(payout, platform, amount, 0)? {
+        return pay_out(src, payout, &payout_key, platform, &cd, amount, 0);
+    }
+    // the payout cannot take it yet: it waits for more; while paused (wind-down, before the program
+    // is closed) it goes to the platform so nothing is left behind
+    if cd[c::PAUSED] == 1 && takes(platform, amount, 0)? {
+        return pay(src, platform, amount);
+    }
+    Ok(())
 }
