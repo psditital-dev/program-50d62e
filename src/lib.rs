@@ -5,14 +5,15 @@
 pub mod math;
 
 use math::{earned, mul_div, Book, BPS};
-use pinocchio::cpi::{Seed, Signer};
+use pinocchio::cpi::{invoke_signed, Seed, Signer};
+use pinocchio::instruction::{InstructionAccount, InstructionView};
 use pinocchio::error::ProgramError;
 use pinocchio::sysvars::{clock::Clock, rent::Rent, Sysvar};
 use pinocchio::{AccountView, Address, ProgramResult, Resize};
 use pinocchio_system::instructions::{Allocate, Assign, Transfer};
 
 #[cfg(not(feature = "no-entrypoint"))]
-pinocchio::program_entrypoint!(process_instruction, 14);
+pinocchio::program_entrypoint!(process_instruction, 16);
 pinocchio::no_allocator!();
 pinocchio::nostd_panic_handler!();
 
@@ -36,6 +37,13 @@ const RESERVED: [Address; 5] = [
     Address::from_str_const("NativeLoader1111111111111111111111111111111"),
     SYSVAR,
 ];
+// Bags (TZ 6.1, round 5): fee-share v2 over Meteora DBC (curve) / DAMM v2 (after migration). BAGS-NOTES.md.
+const FEE2: Address = Address::from_str_const("FEE2tBhCKAt7shrod19QttSVREUYPiyMzoku1mL1gqVK");
+const DBC: Address = Address::from_str_const("dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN");
+const FSC_DISC: [u8; 8] = [40, 71, 136, 156, 222, 49, 31, 201]; // FeeShareConfigHeader
+const FSA_DISC: [u8; 8] = [82, 28, 140, 167, 168, 216, 93, 211]; // FeeShareAuthorityHeader
+const CLAIM_USER: [u8; 8] = [164, 64, 55, 199, 90, 78, 147, 188];
+const CLAIM_USER_VAULT: [u8; 8] = [216, 180, 29, 188, 12, 5, 43, 8];
 const BC_DISC: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
 const SC_DISC: [u8; 8] = [216, 74, 9, 0, 56, 140, 93, 75];
 const POOL_DISC: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
@@ -55,6 +63,8 @@ const TERM: u8 = 3;
 const POSITION: u8 = 4;
 const CLOSED: u8 = 5; // wound-down Source: forwards everything to the creator's payout
 const OFFER: u8 = 6;
+const BAGS: u8 = 7; // Source of a Bags coin: same layout and seeds as SOURCE, fees pulled from Bags fee-share v2
+const CLOSED_BAGS: u8 = 8; // wound-down Bags Source (CLOSED layout)
 mod c {
     pub const BUMP: usize = 1;
     pub const ADMIN: usize = 2;
@@ -249,19 +259,31 @@ fn load<const N: usize>(a: &AccountView, disc: u8) -> Result<[u8; N], ProgramErr
     need(d[0] == disc, Error::BadAccount)?;
     Ok(d)
 }
+/// `load` for a pump or a Bags flavour of the same layout.
+fn load_any<const N: usize>(a: &AccountView, k1: u8, k2: u8) -> Result<[u8; N], ProgramError> {
+    if !a.owned_by(&ID) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if a.data_len() != N {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let d: [u8; N] = rd(&a.try_borrow()?, 0)?;
+    need(d[0] == k1 || d[0] == k2, Error::BadAccount)?;
+    Ok(d)
+}
 fn config(a: &AccountView) -> Result<[u8; c::LEN], ProgramError> {
     let d = load(a, CONFIG)?;
     check_pda(a, &[b"config", &[d[c::BUMP]]])?;
     Ok(d)
 }
 fn source(a: &AccountView) -> Result<[u8; s::LEN], ProgramError> {
-    let d = load(a, SOURCE)?;
+    let d = load_any(a, SOURCE, BAGS)?;
     check_pda(a, &[b"recv", &d[s::MINT..s::MINT + 32], &[d[s::BUMP]]])?;
     Ok(d)
 }
 /// Term of this source, checked by seeds (mint + seq) and stored bump.
 fn closed(a: &AccountView) -> Result<[u8; x::LEN], ProgramError> {
-    let d = load(a, CLOSED)?;
+    let d = load_any(a, CLOSED, CLOSED_BAGS)?;
     check_pda(a, &[b"recv", &d[x::MINT..x::MINT + 32], &[d[x::BUMP]]])?;
     Ok(d)
 }
@@ -475,6 +497,95 @@ fn route_fixed(sc: &AccountView, mint: &Address, recv: &Address) -> ProgramResul
     )
 }
 
+/// The coin's fee route is fixed to the receiver, by coin kind (pump sharing config / Bags fee-share config).
+fn route(sd: &[u8], fee_cfg: &AccountView, mint: &Address, recv: &Address) -> ProgramResult {
+    if sd[0] == BAGS {
+        bags_route_fixed(fee_cfg, mint, recv)
+    } else {
+        route_fixed(fee_cfg, mint, recv)
+    }
+}
+/// Route fixed AND nothing (beyond dust) waits upstream, by coin kind. Slots: pump = sharing config,
+/// bonding curve, pump creator vault, (pool, AMM ATA); Bags = fee-share config, fee-share authority,
+/// DBC pool, receiver WSOL ATA, receiver's Bags vault WSOL ATA.
+fn upstream_clear(sd: &[u8], c1: &AccountView, c2: &AccountView, c3: &AccountView, rest: &[AccountView], mint: &Address, recv: &Address) -> ProgramResult {
+    route(sd, c1, mint, recv)?;
+    if sd[0] == BAGS {
+        bags_swept(recv, c2, c3, rest, mint)
+    } else {
+        swept(c1, c2, c3, rest, mint)
+    }
+}
+
+/// Bags fee-share config of `mint` (bytemuck header after the 8-byte disc): base_mint@8, quote_mint@40,
+/// manager@136, is_init_finalized@176; then Vec<Pubkey> claimers (u32 len@184) and Vec<u16> bps.
+/// Returns the index of `recv` in claimers.
+fn bags_config(fsc: &AccountView, mint: &Address, recv: &Address) -> Result<(usize, Address, bool), ProgramError> {
+    need(
+        fsc.owned_by(&FEE2) && fsc.address() == &pda_of(&[b"fee_share_config", mint.as_ref(), WSOL.as_ref()], &FEE2),
+        Error::BadPumpAccount,
+    )?;
+    let data = fsc.try_borrow()?;
+    need(data.len() >= 188 && rd::<8>(&data, 0)? == FSC_DISC, Error::BadPumpAccount)?;
+    need(key(&data, 8)? == *mint && key(&data, 40)? == WSOL && byte(&data, 176)? == 1, Error::BadPumpAccount)?;
+    let n = u32_at(&data, 184)? as usize;
+    need(n >= 1 && n <= 100, Error::BadPumpAccount)?;
+    let mut idx = n;
+    for i in 0..n {
+        if key(&data, 188 + 32 * i)? == *recv {
+            idx = i;
+        }
+    }
+    let single = n == 1 && idx == 0 && u32_at(&data, 188 + 32 * n)? == 1 && u16_at(&data, 192 + 32 * n)? == 10_000;
+    Ok((idx, key(&data, 136)?, single))
+}
+/// Bags route fixed to the receiver: our receiver is the manager (only the Bags admin can change it
+/// now) and the one claimer at 10000 bps. Bags' admin can still rewrite the config: disclosed to buyers.
+fn bags_route_fixed(fsc: &AccountView, mint: &Address, recv: &Address) -> ProgramResult {
+    let (_, manager, single) = bags_config(fsc, mint, recv)?;
+    need(manager == *recv && single, Error::BadShares)
+}
+/// Nothing beyond dust waits for the receiver upstream: its Bags ledger entry (fee-share authority:
+/// Vec<u64> len@104, entries@112), the DBC pool's partner quote fee (@272), WSOL already paid to the
+/// receiver's ATA but not yet booked (unsynced SOL included), and its Bags vault ATA once the vault exists
+/// (force_claim_user_to_vault). Bags slots: config, authority, DBC pool, receiver ATA, vault, vault ATA. The server puts
+/// claim_dbc + collect_bags before a buy in the same tx. After migration (DBC is_migrated@305) the Bags
+/// partner position cannot be pinned on chain yet: sales stop (BadPumpAccount); collect and claims go on.
+fn bags_swept(recv: &Address, fsa: &AccountView, dbc_pool: &AccountView, rest: &[AccountView], mint: &Address) -> ProgramResult {
+    need(
+        fsa.owned_by(&FEE2) && fsa.address() == &pda_of(&[b"fee_share_authority", mint.as_ref(), WSOL.as_ref()], &FEE2),
+        Error::BadPumpAccount,
+    )?;
+    // the coin must still be on its DBC curve: a migrated Bags coin does not sell (checked first: one clear refusal)
+    need(dbc_pool.owned_by(&DBC) && dbc_pool.data_len() == 424, Error::BadPumpAccount)?;
+    let partner_fee = {
+        let data = dbc_pool.try_borrow()?;
+        need(key(&data, 136)? == *mint && byte(&data, 305)? == 0, Error::BadPumpAccount)?;
+        u64_at(&data, 272)?
+    };
+    {
+        let data = fsa.try_borrow()?;
+        need(data.len() >= 120 && rd::<8>(&data, 0)? == FSA_DISC && u32_at(&data, 104)? >= 1, Error::BadPumpAccount)?;
+        need(u64_at(&data, 112)? <= MIN_COLLECT, Error::FeesNotSwept)?; // single claimer = index 0 (route_fixed)
+    }
+    need(partner_fee <= MIN_COLLECT, Error::FeesNotSwept)?;
+    let [ata, ufv, vata, ..] = rest else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    need(ata.address() == &pda_of(&[recv.as_ref(), TOKEN.as_ref(), WSOL.as_ref()], &ATA), Error::BadAccount)?;
+    need(ufv.address() == &pda_of(&[b"user_fee_vault", recv.as_ref(), mint.as_ref(), WSOL.as_ref()], &FEE2), Error::BadAccount)?;
+    need(vata.address() == &pda_of(&[ufv.address().as_ref(), TOKEN.as_ref(), WSOL.as_ref()], &ATA), Error::BadAccount)?;
+    // the receiver's own WSOL account; its Bags vault account only once the vault exists (only then can it be withdrawn)
+    let cap = add(rent(165)?, MIN_COLLECT)?;
+    for acc in [ata, vata] {
+        if acc.owned_by(&TOKEN) && (core::ptr::eq(acc, ata) || ufv.owned_by(&FEE2)) {
+            let data = acc.try_borrow()?;
+            need(data.len() >= 72 && u64_at(&data, 64)? <= MIN_COLLECT && acc.lamports() <= cap, Error::FeesNotSwept)?;
+        }
+    }
+    Ok(())
+}
+
 /// Bonding curve of `mint` (pump IDL): disc, 5 x u64, complete@48, creator@49, mayhem@81,
 /// cashback@82, quote_mint@83, creator_fee_bps@115, can_edit@123, holder_reward@124, creator_fee@125.
 /// Returns (complete, creator, unswept creator fee).
@@ -578,6 +689,8 @@ pub fn process_instruction(pid: &Address, a: &mut [AccountView], d: &[u8]) -> Pr
         13 => offer(a, args),
         14 => take(a, args),
         15 => cancel_offer(a),
+        16 => register_bags_source(a, args),
+        17 => collect_bags(a),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -680,6 +793,150 @@ fn register_source(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     save(src, &sd)
 }
 
+/// Bags coin (TZ 6.1). [creator(S,W), config, source(W), fee_share_config, system]; args: mint.
+/// Signer = the config's current manager (the creator), BEFORE the Bags API txs move claimers + manager
+/// to the receiver; list_term / buy then re-check that route every time.
+fn register_bags_source(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
+    let [creator, cfg, src, fsc, sys, ..] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    live(&config(cfg)?)?;
+    system(sys)?;
+    let mint = key(d, 0)?;
+    let (_, manager, _) = bags_config(fsc, &mint, src.address())?;
+    need(manager == *creator.address(), Error::Unauthorized)?;
+    let bump = [find(&[b"recv", mint.as_ref()], src)?];
+    init_account(creator, src, s::LEN, &[Seed::from(b"recv"), Seed::from(mint.as_ref()), Seed::from(&bump)])?;
+    let mut sd = [0u8; s::LEN];
+    sd[0] = BAGS;
+    sd[s::BUMP] = bump[0];
+    put(&mut sd, s::MINT, mint.as_ref())?;
+    put(&mut sd, s::CREATOR, creator.address().as_ref())?;
+    put(&mut sd, s::PAYOUT, creator.address().as_ref())?;
+    save(src, &sd)
+}
+
+/// Permissionless: pull the receiver's Bags ledger into the receiver as SOL, then book like `collect`.
+/// [payer(S,W), source(W), term(W), fee_share_config, fee_share_authority(W), authority WSOL ATA(W),
+///  receiver WSOL ATA(W), base_mint, WSOL, system, token, associated token, FEE2 event authority, FEE2,
+///  receiver Bags user_fee_vault, its WSOL ATA(W)].
+/// claim_user (receiver signs by seeds) pays WSOL to the receiver's ATA; the ATA is closed into the
+/// receiver. Only an ATA claim_user created in this call gives its rent back to the payer; anything else
+/// on it (WSOL, unsynced SOL) is income. A Bags vault balance (force_claim_user_to_vault) is withdrawn
+/// with claim_user_vault, which unwraps straight onto the receiver.
+/// A wound-down Bags receiver is claimed the same way; `collect` then forwards it.
+fn collect_bags(a: &mut [AccountView]) -> ProgramResult {
+    let [payer, src, tm, fsc, fsa, fsa_ata, ata, base, quote, sys, tok, atap, ev, fee2, ufv, vata, ..] = a else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    signer(payer)?;
+    writable(src)?;
+    need(src.owned_by(&ID), Error::BadAccount)?;
+    let (open, mint, bump) = {
+        let data = src.try_borrow()?;
+        let kind = byte(&data, 0)?;
+        need((kind == BAGS && data.len() == s::LEN) || (kind == CLOSED_BAGS && data.len() == x::LEN), Error::BadAccount)?;
+        (kind == BAGS, key(&data, s::MINT)?, byte(&data, s::BUMP)?)
+    };
+    check_pda(src, &[b"recv", mint.as_ref(), &[bump]])?;
+    system(sys)?;
+    need(tok.address() == &TOKEN && atap.address() == &ATA && fee2.address() == &FEE2, Error::BadAccount)?;
+    need(base.address() == &mint && quote.address() == &WSOL, Error::BadAccount)?;
+    need(ev.address() == &pda_of(&[b"__event_authority"], &FEE2), Error::BadAccount)?;
+    need(ata.address() == &pda_of(&[src.address().as_ref(), TOKEN.as_ref(), WSOL.as_ref()], &ATA), Error::BadAccount)?;
+    let (idx, _, _) = bags_config(fsc, &mint, src.address())?;
+    need(
+        fsa.owned_by(&FEE2) && fsa.address() == &pda_of(&[b"fee_share_authority", mint.as_ref(), WSOL.as_ref()], &FEE2),
+        Error::BadPumpAccount,
+    )?;
+    let due = {
+        let data = fsa.try_borrow()?;
+        need(data.len() >= 112 && rd::<8>(&data, 0)? == FSA_DISC, Error::BadPumpAccount)?;
+        if idx < u32_at(&data, 104)? as usize { u64_at(&data, 112 + 8 * idx)? } else { 0 }
+    };
+    need(ufv.address() == &pda_of(&[b"user_fee_vault", src.address().as_ref(), mint.as_ref(), WSOL.as_ref()], &FEE2), Error::BadAccount)?;
+    need(vata.address() == &pda_of(&[ufv.address().as_ref(), TOKEN.as_ref(), WSOL.as_ref()], &ATA), Error::BadAccount)?;
+    let existed = ata.owned_by(&TOKEN);
+    let pre_lamports = ata.lamports(); // a prefunded empty address: the payer only tops it up to rent
+    let seeds = [Seed::from(b"recv"), Seed::from(mint.as_ref()), Seed::from(core::slice::from_ref(&bump))];
+    let signers = [Signer::from(&seeds[..])];
+    if ufv.owned_by(&FEE2) && vata.owned_by(&TOKEN) && vata.data_len() >= 72 {
+        // SyncNative (token ix 17, no signer): SOL sent straight to the WSOL account counts as its balance
+        let metas = [InstructionAccount::writable(vata.address())];
+        let ix = InstructionView { program_id: &TOKEN, data: &[17u8], accounts: &metas };
+        invoke_signed(&ix, &[&*vata], &[])?;
+    }
+    if ufv.owned_by(&FEE2) && vata.owned_by(&TOKEN) && vata.data_len() >= 72 && u64_at(&vata.try_borrow()?, 64)? > 0 {
+        let metas = [
+            InstructionAccount::writable_signer(src.address()),
+            InstructionAccount::readonly(ufv.address()),
+            InstructionAccount::writable(vata.address()),
+            InstructionAccount::readonly(base.address()),
+            InstructionAccount::readonly(quote.address()),
+            InstructionAccount::readonly(tok.address()),
+            InstructionAccount::readonly(ev.address()),
+            InstructionAccount::readonly(fee2.address()),
+        ];
+        let ix = InstructionView { program_id: &FEE2, data: &CLAIM_USER_VAULT, accounts: &metas };
+        invoke_signed(&ix, &[&*src, &*ufv, &*vata, &*base, &*quote, &*tok, &*ev, &*fee2], &signers)?;
+    }
+    if due > 0 {
+        let mut data = [0u8; 12];
+        data[..8].copy_from_slice(&CLAIM_USER);
+        data[8..].copy_from_slice(&(idx as u32).to_le_bytes());
+        let metas = [
+            InstructionAccount::writable_signer(payer.address()),
+            InstructionAccount::writable_signer(src.address()),
+            InstructionAccount::readonly(fsc.address()),
+            InstructionAccount::writable(fsa.address()),
+            InstructionAccount::writable(fsa_ata.address()),
+            InstructionAccount::writable(ata.address()),
+            InstructionAccount::readonly(base.address()),
+            InstructionAccount::readonly(quote.address()),
+            InstructionAccount::readonly(sys.address()),
+            InstructionAccount::readonly(tok.address()),
+            InstructionAccount::readonly(atap.address()),
+            InstructionAccount::readonly(ev.address()),
+            InstructionAccount::readonly(fee2.address()),
+        ];
+        let ix = InstructionView { program_id: &FEE2, data: &data, accounts: &metas };
+        invoke_signed(&ix, &[&*payer, &*src, &*fsc, &*fsa, &*fsa_ata, &*ata, &*base, &*quote, &*sys, &*tok, &*atap, &*ev, &*fee2], &signers)?;
+    }
+    if ata.owned_by(&TOKEN) && ata.data_len() == 165 {
+        // SPL token account: mint@0, owner@32, amount@64. Close it into the receiver (WSOL unwraps).
+        let amount = {
+            let data = ata.try_borrow()?;
+            need(key(&data, 0)? == WSOL && key(&data, 32)? == *src.address(), Error::BadAccount)?;
+            u64_at(&data, 64)?
+        };
+        // rent back only for the ATA claim_user just created (the payer funded it); a pre-existing ATA's
+        // whole balance, unsynced SOL included, is the receiver's income
+        let refund = if existed { 0 } else { rent(165)?.saturating_sub(pre_lamports).min(sub(ata.lamports(), amount)?) };
+        let metas = [
+            InstructionAccount::writable(ata.address()),
+            InstructionAccount::writable(src.address()),
+            InstructionAccount::readonly_signer(src.address()),
+        ];
+        let ix = InstructionView { program_id: &TOKEN, data: &[9u8], accounts: &metas };
+        invoke_signed(&ix, &[&*ata, &*src, &*src], &signers)?;
+        pay(src, payer, refund)?;
+    }
+    if !open {
+        return Ok(());
+    }
+    let mut sd = source(src)?;
+    let now = now()?;
+    if now < i64_at(&sd, s::END)? {
+        need(tm.address() == &key(&sd, s::TERM)?, Error::BadAccount)?;
+        let mut td = term(tm, &sd)?;
+        book(&mut sd, src.lamports(), Some(&mut td), now, false)?;
+        save(tm, &td)?;
+    } else {
+        book(&mut sd, src.lamports(), None, now, false)?;
+    }
+    save(src, &sd)
+}
+
 /// [creator(S,W), config, source(W), term(W), sharing_config, system];
 /// args: share_bps u16, units u32, days u8 (7|30), price u64, [curve u8: 1 = price falls with the time left].
 fn list_term(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
@@ -709,7 +966,7 @@ fn list_term(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     // Income booked before the term belongs to the creator.
     book(&mut sd, src.lamports(), None, now, true)?;
     let mint = key(&sd, s::MINT)?;
-    route_fixed(sc, &mint, src.address())?;
+    route(&sd, sc, &mint, src.address())?;
     let seq = add(u64_at(&sd, s::SEQ)?, 1)?.to_le_bytes();
     let bump = [find(&[b"term", mint.as_ref(), &seq], tm)?];
     init_account(
@@ -760,8 +1017,7 @@ fn buy(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     need(payout.address() == &key(&sd, s::PAYOUT)?, Error::Unauthorized)?;
     need(platform.address() == &key(&cd, c::PLATFORM)?, Error::Unauthorized)?;
     need(buyer.address() != &key(&sd, s::CREATOR)? && buyer.address() != payout.address(), Error::BadParams)?;
-    route_fixed(sc, &mint, src.address())?;
-    swept(sc, bc, vault, rest, &mint)?;
+    upstream_clear(&sd, sc, bc, vault, rest, &mint, src.address())?;
     let now = now()?;
     need(now < i64_at(&td, t::END)?, Error::TermEnded)?;
     // Book pending income first so a purchase never shares fees that arrived before it.
@@ -846,8 +1102,7 @@ fn take(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
     let mint = key(&sd, s::MINT)?;
     need(tm.address() == &key(&sd, s::TERM)?, Error::BadAccount)?;
     need(buyer.address() != &key(&sd, s::CREATOR)? && buyer.address() != &key(&sd, s::PAYOUT)?, Error::BadParams)?;
-    route_fixed(sc, &mint, src.address())?;
-    swept(sc, bc, vault, rest, &mint)?;
+    upstream_clear(&sd, sc, bc, vault, rest, &mint, src.address())?;
     let now = now()?;
     need(now < i64_at(&td, t::END)?, Error::TermEnded)?;
     // income that arrived before the sale is the seller's: book it into the index first
@@ -1038,12 +1293,12 @@ fn set_payout(a: &mut [AccountView], d: &[u8]) -> ProgramResult {
         Error::BadParams,
     )?;
     let kind = if target.owned_by(&ID) { byte(&target.try_borrow()?, 0)? } else { 0 };
-    if kind == CLOSED {
+    if kind == CLOSED || kind == CLOSED_BAGS {
         let mut xd = closed(target)?;
         need(who.address() == &key(&xd, x::CREATOR)?, Error::Unauthorized)?;
         put(&mut xd, x::PAYOUT, payout.as_ref())?;
         save(target, &xd)
-    } else if kind == SOURCE {
+    } else if kind == SOURCE || kind == BAGS {
         let mut sd = source(target)?;
         need(who.address() == &key(&sd, s::CREATOR)?, Error::Unauthorized)?;
         put(&mut sd, s::PAYOUT, payout.as_ref())?;
@@ -1106,7 +1361,7 @@ fn close_source(a: &mut [AccountView]) -> ProgramResult {
         pay_out(src, payout, &payout_key, platform, &cd, all, 0)?;
     }
     let mut xd = [0u8; x::LEN];
-    xd[0] = CLOSED;
+    xd[0] = if sd[0] == BAGS { CLOSED_BAGS } else { CLOSED };
     xd[x::BUMP] = sd[s::BUMP];
     put(&mut xd, x::MINT, &sd[s::MINT..s::MINT + 32])?;
     put(&mut xd, x::CREATOR, &sd[s::CREATOR..s::CREATOR + 32])?;
